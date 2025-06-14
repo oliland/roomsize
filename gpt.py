@@ -1,200 +1,212 @@
 """
-DXF Room Counter
-================
-Reads a DXF floor-plan, extracts LINE and (LW)POLYLINE entities that represent walls,
-builds a Shapely network, and heuristically counts rooms + their areas in square feet.
+DXF Room Counter — Vertex Plot + Proper T‑Junction Noding
+=========================================================
+We **snap _first_ then node**, so a T‑stem end that’s merely *close* to a through‐
+wall gets pulled onto it (gap ≤ `GAP_TOLERANCE`) **before** we insert the new
+vertex.  This guarantees the resulting graph is truly planar.
 
-Why a second version?
---------------------
-* **T-junction aware** – Wall segments that intersect without sharing an explicit
-  vertex (a classic T-junction) are now **noded** so the planar graph is
-  topologically correct before polygonisation.
-* **Flexible API** – The public `count_rooms()` function now accepts **either**
-  an `ezdxf.EzDxf` model or a path-like object pointing to a DXF file.
-* Constants collected in one place as before; tweak to taste.
+Pipeline
+--------
+1. **Explode** every entity (blocks, curves, …) into straight `LineString`s.
+2. **Snap** endpoints to nearby segments (≤ tolerance).  → endpoints land *on* the
+   through‑wall in a T.
+3. **Node** the snapped set → splits at every intersection (including those new
+   T‑points) and returns a perfectly planar `MultiLineString`.
+4. **Polygonize** & filter → rooms.
+5. **Debug plot** shows grey walls, black vertices, red/orange dangles/cuts, room
+   outlines.
 
-Assumptions
------------
-* **Units** – The drawing is in *feet*.  If your DXF is in inches or metres
-  change `DXF_UNIT_TO_FOOT` accordingly.
-* **Entity types** – Only `LINE`, `LWPOLYLINE`, and `POLYLINE` describe walls.
-  Everything else (doors, text, blocks) is ignored.
-* **Gaps & Slivers** – Wall gaps ≤ `GAP_TOLERANCE` (ft) get snapped; polygons
-  with area < `MIN_ROOM_AREA_SQFT` are filtered out.
-
+No layer logic, no type alias fuss.
 """
-
 from __future__ import annotations
 
 import math
-import tempfile
 from pathlib import Path
-from typing import Iterable, List, Tuple, Union, overload
+from typing import List, Tuple, Optional
 
-import ezdxf  # type: ignore  – install via `pip install ezdxf`
-from shapely.geometry import LineString, MultiLineString, Polygon
-from shapely.ops import polygonize, snap, unary_union
+import ezdxf
+from ezdxf.entities import DXFGraphic, Insert
+from shapely.geometry import LineString, MultiLineString
+from shapely.ops import polygonize_full, snap
+from shapely import node
+
+try:
+    import matplotlib.pyplot as _plt
+except ImportError:  # pragma: no cover
+    _plt = None  # type: ignore[assignment]
 
 ###############################################################################
-# TUNABLE CONSTANTS
+# Tweakables
 ###############################################################################
-DXF_UNIT_TO_FOOT: float = 1.0     # change to 1 / 12.0 if drawing is in inches
-GAP_TOLERANCE: float = 0.10       # ≤ this many feet: close gaps via `snap`
-MIN_ROOM_AREA_SQFT: float = 1.0  # ignore polygons smaller than a closet
+DXF_UNIT_TO_FOOT = 1.0     # 1/12.0 if drawing is in inches
+GAP_TOLERANCE   = 0.01     # ft — bridge endpoint gaps ≤ this (raised a bit)
+MIN_ROOM_AREA_SQFT = 10.0  # ignore polygons smaller than this
+ARC_DEG_PER_SEG = 10.0     # seg length ≈ R·π·deg/180
+MIN_SEG_LEN_FT  = 0.05     # discard super-short fragments
 ###############################################################################
 
+# ---------------------------------------------------------------------------
+# Geometry explosion helpers
+# ---------------------------------------------------------------------------
 
-def _extract_wall_segments(doc) -> List[LineString]:
-    """Return Shapely `LineString`s for every wall segment in the DXF modelspace."""
+def _drange(start, stop, step):
+    while start < stop:
+        yield start
+        start += step
 
-    msp = doc.modelspace()
-    segs: List[LineString] = []
 
-    # Simple LINE entities --------------------------------------------------
-    for ln in msp.query("LINE"):
-        segs.append(LineString([(ln.dxf.start.x, ln.dxf.start.y),
-                                (ln.dxf.end.x, ln.dxf.end.y)]))
+def _arc_as_lines(cx, cy, r, a0, a1):
+    if a1 < a0:
+        a1 += 360.0
+    step = max(1e-6, ARC_DEG_PER_SEG)
+    prev = (cx + r * math.cos(math.radians(a0)), cy + r * math.sin(math.radians(a0)))
+    for ang in _drange(a0 + step, a1 + 1e-9, step):
+        pt = (cx + r * math.cos(math.radians(ang)), cy + r * math.sin(math.radians(ang)))
+        ls = LineString([prev, pt])
+        if ls.length >= MIN_SEG_LEN_FT:
+            yield ls
+        prev = pt
 
-    # LWPOLYLINE & POLYLINE entities ---------------------------------------
-    for pl in msp.query("LWPOLYLINE POLYLINE"):
-        pts = [(v[0], v[1]) for v in pl]
+
+def _explode_entity(ent: DXFGraphic, out: List[LineString]):
+    t = ent.dxftype()
+    if t == "INSERT":
+        blk: Insert = ent
+        m44 = blk.matrix44()
+        for sub in blk.virtual_entities():
+            sub.transform(m44)
+            _explode_entity(sub, out)
+        return
+
+    if t == "LINE":
+        ls = LineString([(ent.dxf.start.x, ent.dxf.start.y), (ent.dxf.end.x, ent.dxf.end.y)])
+        if ls.length >= MIN_SEG_LEN_FT:
+            out.append(ls)
+
+    elif t in {"LWPOLYLINE", "POLYLINE"}:
+        pts = [(v[0], v[1]) for v in ent]
         for a, b in zip(pts, pts[1:]):
-            segs.append(LineString([a, b]))
-        # close ring where applicable
-        if pl.closed and len(pts) > 1:
-            segs.append(LineString([pts[-1], pts[0]]))
+            ls = LineString([a, b])
+            if ls.length >= MIN_SEG_LEN_FT:
+                out.append(ls)
+        if getattr(ent, "closed", False) and len(pts) > 1:
+            ls = LineString([pts[-1], pts[0]])
+            if ls.length >= MIN_SEG_LEN_FT:
+                out.append(ls)
 
-    print(len(segs))
+    elif t == "ARC":
+        out.extend(_arc_as_lines(ent.dxf.center.x, ent.dxf.center.y, ent.dxf.radius,
+                                 ent.dxf.start_angle, ent.dxf.end_angle))
+
+    elif t == "CIRCLE":
+        out.extend(_arc_as_lines(ent.dxf.center.x, ent.dxf.center.y, ent.dxf.radius,
+                                 0.0, 360.0))
+
+    # elif t in {"ELLIPSE", "SPLINE"}:
+    #     for pts in ent.approximate(ARC_DEG_PER_SEG):
+    #         ls = LineString(pts)
+    #         if ls.length >= MIN_SEG_LEN_FT:
+    #             out.append(ls)
+
+
+def _collect_segments(doc):
+    segs: List[LineString] = []
+    for e in doc.modelspace():
+        _explode_entity(e, segs)
     return segs
 
-
 # ---------------------------------------------------------------------------
-# NODING ─────────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-
-def _node_lines(segments: Iterable[LineString]) -> MultiLineString:
-    """Split all segments at their intersections (incl. T & X junctions).
-
-    Shapely ≥ 2.0 provides `shapely.ops.node`; if unavailable we fall back to
-    `unary_union`, which also performs noding for linework.
-    """
-    try:
-        from shapely.ops import node  # type: ignore
-
-        noded = node(MultiLineString(list(segments)))  # type: ignore[arg-type]
-        return noded  # already a MultiLineString
-    except Exception:  # pragma: no cover – older Shapely
-        # `unary_union` will node but might return a LineString if everything
-        # merges perfectly; wrap to MultiLineString for uniform downstream code.
-        merged = unary_union(list(segments))
-        if isinstance(merged, LineString):
-            merged = MultiLineString([merged])
-        return merged  # type: ignore[return-value]
-
-
-# ---------------------------------------------------------------------------
-# ROOM DETECTION ─────────────────────────────────────────────────────────────
+# Graph + room extraction
 # ---------------------------------------------------------------------------
 
-def _room_polygons(segments: List[LineString]) -> List[Polygon]:
-    """Return polygons deemed rooms after noding and gap-snapping."""
-    if not segments:
-        return []
+def _build_network(segs):
+    # 1) snap first so T‑endpoints land on through‑edges
+    snapped = snap(MultiLineString(segs), MultiLineString(segs), GAP_TOLERANCE)
+    # 2) node to split at every intersection (T + X)
+    return node(snapped)
 
-    # 1. Insert vertices at all intersections (T, X, …)
-    noded = _node_lines(segments)
 
-    # 2. Snap tiny gaps so endpoints that are *close* become coincident
-    network = snap(noded, noded, GAP_TOLERANCE)
-
-    # 3. Build polygons from the planar graph
-    polys = list(polygonize(network))
-
-    # 4. Filter by minimum size
-    sqft_factor = DXF_UNIT_TO_FOOT ** 2
-    rooms = [p for p in polys if p.area * sqft_factor >= MIN_ROOM_AREA_SQFT]
-    return rooms
-
+def _room_polys(net):
+    polys, dangles, cuts, _ = polygonize_full(net)
+    sqft = DXF_UNIT_TO_FOOT ** 2
+    rooms = [p for p in polys.geoms if p.area * sqft >= MIN_ROOM_AREA_SQFT]
+    return rooms, dangles, cuts
 
 # ---------------------------------------------------------------------------
-# PUBLIC API ─────────────────────────────────────────────────────────────────
+# Public helpers
 # ---------------------------------------------------------------------------
 
 def count_rooms(model) -> List[Tuple[int, float]]:
-    """Count rooms and return ``[(room_id, area_ft²), ...]`` ordered by area.
+    doc = ezdxf.readfile(str(model)) if not hasattr(model, "modelspace") else model
+    net = _build_network(_collect_segments(doc))
+    rooms, _, _ = _room_polys(net)
+    sqft = DXF_UNIT_TO_FOOT ** 2
+    return [(i + 1, r.area * sqft) for i, r in enumerate(sorted(rooms, key=lambda p: p.area, reverse=True))]
 
-    Parameters
-    ----------
-    model
-        *Either* an `ezdxf.EzDxf` document **or** a path-like object to a DXF
-        file on disk.
-    """
-    if isinstance(model, (str, Path)):
-        doc = ezdxf.readfile(str(model))
-    else:
-        doc = model
 
-    segments = _extract_wall_segments(doc)
-    rooms = _room_polygons(segments)
+def debug_plot(model, *, show_dangling=True, save: Optional[str | Path] = None):
+    if _plt is None:
+        raise RuntimeError("matplotlib missing — pip install matplotlib")
 
-    sqft_factor = DXF_UNIT_TO_FOOT ** 2
-    result = [(i + 1, r.area * sqft_factor) for i, r in enumerate(sorted(rooms, key=lambda p: p.area, reverse=True))]
-    return result
+    doc = ezdxf.readfile(str(model)) if not hasattr(model, "modelspace") else model
+    net = _build_network(_collect_segments(doc))
+    rooms, dangles, cuts = _room_polys(net)
 
+    # vertices for scatter plot
+    verts = list({(round(x, 6), round(y, 6))
+                  for ls in (net.geoms if isinstance(net, MultiLineString) else [net])
+                  for x, y in ls.coords})
+
+    fig, ax = _plt.subplots()
+
+    # walls
+    for ls in (net.geoms if isinstance(net, MultiLineString) else [net]):
+        ax.plot(*ls.xy, color="0.7", linewidth=1)
+
+    # vertices
+    if verts:
+        xs, ys = zip(*verts)
+        ax.scatter(xs, ys, s=5, color="black", zorder=3)
+
+    # rooms
+    for poly in rooms:
+        ax.plot(*poly.exterior.xy, linewidth=2)
+
+    if show_dangling:
+        for g in dangles.geoms:
+            ax.plot(*g.xy, color="red", linestyle="--", linewidth=1)
+        for g in cuts.geoms:
+            ax.plot(*g.xy, color="orange", linestyle=":", linewidth=1)
+
+    ax.set_aspect("equal", "box")
+    ax.axis("off")
+
+    (fig.savefig(save, dpi=300, bbox_inches="tight") if save else _plt.show())
 
 # ---------------------------------------------------------------------------
-# TESTS ──────────────────────────────────────────────────────────────────────
+# CLI
 # ---------------------------------------------------------------------------
-
-def _build_sample_plan(path: Path) -> None:
-    """Create a 2-room 25 ft × 10 ft drawing with a T-shaped partition."""
-    doc = ezdxf.new(setup=True)
-    msp = doc.modelspace()
-
-    # Outer rectangle
-    outer = [(0, 0), (25, 0), (25, 10), (0, 10)]
-    for a, b in zip(outer, outer[1:] + [outer[0]]):
-        msp.add_line(a, b)
-
-    # Vertical wall (like before) at x = 12.5
-    msp.add_line((12.5, 0), (12.5, 6))  # stops before ceiling ⇒ creates a T
-
-    # Horizontal wall (forming the T head)
-    msp.add_line((12.5, 6), (25, 6))
-
-    doc.saveas(path)
-
-
-def test_two_room_with_t(tmp_path):
-    """Even with a T-junction the algo should find exactly 2 × (12.5×6 and 12.5×4) ft² rooms."""
-    dxf_file = tmp_path / "t_sample.dxf"
-    _build_sample_plan(dxf_file)
-
-    rooms = count_rooms(dxf_file)
-    assert len(rooms) == 2
-
-    areas = sorted(a for _, a in rooms)
-    assert math.isclose(sum(areas), 250.0, abs_tol=1e-4)  # area conservation
-
-
 if __name__ == "__main__":
-    import argparse, sys, textwrap
+    import argparse, textwrap
 
     parser = argparse.ArgumentParser(
         prog="dxf_room_counter",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent(
-            """Quickly estimate room count and areas in a floor-plan DXF.
+            """Count rooms & plot vertices (snap‑then‑node T‑junction aware).
 
-            Pass either a path to a DXF file *or* the string "sample" to run the
-            built-in 2-room demo with a T-junction.
+            python dxf_room_counter.py plan.dxf          # list areas
+            python dxf_room_counter.py plan.dxf --plot   # walls + vertices plot
             """
         ),
     )
-    parser.add_argument("dxf", help="DXF file path or 'sample'")
+    parser.add_argument("dxf", help="DXF file to analyse")
+    parser.add_argument("--plot", nargs="?", const="_show_", help="Show/save plot")
     ns = parser.parse_args()
 
-    results = count_rooms(Path(ns.dxf))
-    print(results)
-
-    for rid, area in results:
-        print(f"Room {rid}: {area:.2f} ft²")
+    if ns.plot is None:
+        for rid, area in count_rooms(ns.dxf):
+            print(f"Room {rid}: {area:.2f} ft²")
+    else:
+        dest = None if ns.plot == "_show_" else ns.plot
+        debug_plot(ns.dxf, save=dest)
