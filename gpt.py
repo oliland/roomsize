@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 import ezdxf
+from ezdxf.upright import upright_all
 from ezdxf.entities import DXFGraphic, Insert
 from shapely.geometry import LineString, MultiLineString
 from shapely.ops import polygonize_full, snap
@@ -40,9 +41,9 @@ except ImportError:  # pragma: no cover
 ###############################################################################
 DXF_UNIT_TO_FOOT = 1.0     # 1/12.0 if drawing is in inches
 GAP_TOLERANCE   = 0.01     # ft — bridge endpoint gaps ≤ this (raised a bit)
-MIN_ROOM_AREA_SQFT = 10.0  # ignore polygons smaller than this
+MIN_ROOM_AREA_SQFT = 5.0  # ignore polygons smaller than this
 ARC_DEG_PER_SEG = 10.0     # seg length ≈ R·π·deg/180
-MIN_SEG_LEN_FT  = 0.05     # discard super-short fragments
+MIN_SEG_LEN_FT  = 0.01     # discard super-short fragments
 ###############################################################################
 
 # ---------------------------------------------------------------------------
@@ -72,9 +73,10 @@ def _explode_entity(ent: DXFGraphic, out: List[LineString]):
     t = ent.dxftype()
     if t == "INSERT":
         blk: Insert = ent
-        m44 = blk.matrix44()
+        # m44 = blk.matrix44()
         for sub in blk.virtual_entities():
-            sub.transform(m44)
+            # sub.transform(m44)
+            upright_all([sub])
             _explode_entity(sub, out)
         return
 
@@ -102,12 +104,16 @@ def _explode_entity(ent: DXFGraphic, out: List[LineString]):
         out.extend(_arc_as_lines(ent.dxf.center.x, ent.dxf.center.y, ent.dxf.radius,
                                  0.0, 360.0))
 
-    # elif t in {"ELLIPSE", "SPLINE"}:
-    #     for pts in ent.approximate(ARC_DEG_PER_SEG):
-    #         ls = LineString(pts)
-    #         if ls.length >= MIN_SEG_LEN_FT:
-    #             out.append(ls)
-
+    elif t in {"ELLIPSE", "SPLINE"}:
+        # 1. Grab every vertex the DXF entity produces
+        verts_3d = list(ent.flattening(0.1))      # [(x, y, z), …]
+        # 2. Shapely 1.x is strictly 2-D, so strip Z; with Shapely 2.x you can skip this
+        coords_2d = [(x, y) for x, y, *_ in verts_3d]
+        # 3. Make sure we actually have a segment, then build the geometry once
+        if len(coords_2d) >= 2:                         # LineString needs ≥ 2 points
+            ls = LineString(coords_2d)
+            if ls.length >= MIN_SEG_LEN_FT:
+                out.append(ls)
 
 def _collect_segments(doc):
     segs: List[LineString] = []
@@ -164,9 +170,9 @@ def debug_plot(model, *, show_dangling=True, save: Optional[str | Path] = None):
         ax.plot(*ls.xy, color="0.7", linewidth=1)
 
     # vertices
-    if verts:
-        xs, ys = zip(*verts)
-        ax.scatter(xs, ys, s=5, color="black", zorder=3)
+    # if verts:
+    #     xs, ys = zip(*verts)
+    #     ax.scatter(xs, ys, s=5, color="black", zorder=3)
 
     # rooms
     for poly in rooms:
