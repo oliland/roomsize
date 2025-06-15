@@ -44,7 +44,16 @@ GAP_TOLERANCE   = 0.01     # ft — bridge endpoint gaps ≤ this (raised a bit)
 MIN_ROOM_AREA_SQFT = 5.0  # ignore polygons smaller than this
 ARC_DEG_PER_SEG = 10.0     # seg length ≈ R·π·deg/180
 MIN_SEG_LEN_FT  = 0.01     # discard super-short fragments
+
 ###############################################################################
+# Door-swing heuristic (works for ARC **and** SPLINE)
+###############################################################################
+DOOR_ARC_MIN_ANG        = 80.0      # deg   – arc sweep we expect
+DOOR_ARC_MAX_ANG        = 100.0
+DOOR_CHORD_MIN_FT       = 0.1       # ft    – doorway width ≈ chord length
+DOOR_CHORD_MAX_FT       = 10.5
+ARCLEN_CHORD_RATIO_MIN  = 0.07      # len(arc)/len(chord) for 80–100°
+ARCLEN_CHORD_RATIO_MAX  = 5.25
 
 # ---------------------------------------------------------------------------
 # Geometry explosion helpers
@@ -122,6 +131,77 @@ def _collect_segments(doc):
     return segs
 
 # ---------------------------------------------------------------------------
+# Door detection (returns doorway chords, not the swing arc)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Door detection  –  returns doorway chords, not the swing curve itself
+# ---------------------------------------------------------------------------
+def _door_chords(doc) -> List[LineString]:
+    chords: List[LineString] = []
+
+    def _push(p0, p1):
+        chords.append(LineString([p0, p1]))
+
+    def _looks_like_door_arc(chord_len_ft, ratio):
+        return (DOOR_CHORD_MIN_FT < chord_len_ft < DOOR_CHORD_MAX_FT
+                and ARCLEN_CHORD_RATIO_MIN < ratio < ARCLEN_CHORD_RATIO_MAX)
+
+    def _walk(ent: DXFGraphic):
+        t = ent.dxftype()
+
+        # recurse into blocks
+        if t == "INSERT":
+            for sub in ent.virtual_entities():
+                upright_all([sub])
+                _walk(sub)
+            return
+
+        # ------------------------------------------------------------------#
+        # Plain ARC swing
+        # ------------------------------------------------------------------#
+        if t == "ARC":
+            arc = ent
+            sweep = abs(arc.dxf.end_angle - arc.dxf.start_angle)
+            if not (DOOR_ARC_MIN_ANG < sweep < DOOR_ARC_MAX_ANG):
+                return
+
+            cx, cy, r = arc.dxf.center.x, arc.dxf.center.y, arc.dxf.radius
+            a0, a1 = math.radians(arc.dxf.start_angle), math.radians(arc.dxf.end_angle)
+            p0 = (cx + r * math.cos(a0), cy + r * math.sin(a0))
+            p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
+            chord_len_ft = LineString([p0, p1]).length * DXF_UNIT_TO_FOOT
+            if DOOR_CHORD_MIN_FT < chord_len_ft < DOOR_CHORD_MAX_FT:
+                _push(p0, p1)
+            return
+
+        # ------------------------------------------------------------------#
+        # Spline door swing
+        # ------------------------------------------------------------------#
+        if t in {"SPLINE", "ELLIPSE"}:
+            pts3d = list(ent.flattening(0.1))
+            if len(pts3d) < 3:
+                return
+            pts2d = [(x, y) for x, y, *_ in pts3d]
+            p0, p1 = pts2d[0], pts2d[-1]
+            chord = LineString([p0, p1])
+            chord_len_ft = chord.length * DXF_UNIT_TO_FOOT
+
+            # approximate arc length with polyline length
+            arclen_ft = sum(
+                math.hypot(bx - ax, by - ay)
+                for (ax, ay), (bx, by) in zip(pts2d, pts2d[1:])
+            ) * DXF_UNIT_TO_FOOT
+            ratio = arclen_ft / chord_len_ft if chord_len_ft else 9e9
+
+            if _looks_like_door_arc(chord_len_ft, ratio):
+                _push(p0, p1)
+
+    for e in doc.modelspace():
+        _walk(e)
+    return chords
+
+# ---------------------------------------------------------------------------
 # Graph + room extraction
 # ---------------------------------------------------------------------------
 
@@ -150,18 +230,34 @@ def count_rooms(model) -> List[Tuple[int, float]]:
     return [(i + 1, r.area * sqft) for i, r in enumerate(sorted(rooms, key=lambda p: p.area, reverse=True))]
 
 
-def debug_plot(model, *, show_dangling=True, save: Optional[str | Path] = None):
+def debug_plot(model, *,
+               show_dangling=True,
+               show_doors=False,
+               doors_only=False,
+               save: Optional[str | Path] = None):
+    """
+    show_doors=True   → overlay doorway chords in blue
+    doors_only=True   → plot ONLY the doors (quick visual check)
+    """
     if _plt is None:
         raise RuntimeError("matplotlib missing — pip install matplotlib")
 
-    doc = ezdxf.readfile(str(model)) if not hasattr(model, "modelspace") else model
-    net = _build_network(_collect_segments(doc))
-    rooms, dangles, cuts = _room_polys(net)
+    doc   = ezdxf.readfile(str(model)) if not hasattr(model, "modelspace") else model
+    doors = _door_chords(doc)
 
-    # vertices for scatter plot
-    verts = list({(round(x, 6), round(y, 6))
-                  for ls in (net.geoms if isinstance(net, MultiLineString) else [net])
-                  for x, y in ls.coords})
+    # -- fast path: doors-only ---------------------------------------------
+    if doors_only:
+        fig, ax = _plt.subplots()
+        for d in doors:
+            ax.plot(*d.xy, color="blue", linewidth=2)
+        ax.set_aspect("equal", "box")
+        ax.axis("off")
+        (fig.savefig(save, dpi=300, bbox_inches="tight") if save else _plt.show())
+        return
+
+    # -- standard room plot -------------------------------------------------
+    net   = _build_network(_collect_segments(doc))
+    rooms, dangles, cuts = _room_polys(net)
 
     fig, ax = _plt.subplots()
 
@@ -169,14 +265,14 @@ def debug_plot(model, *, show_dangling=True, save: Optional[str | Path] = None):
     for ls in (net.geoms if isinstance(net, MultiLineString) else [net]):
         ax.plot(*ls.xy, color="0.7", linewidth=1)
 
-    # vertices
-    # if verts:
-    #     xs, ys = zip(*verts)
-    #     ax.scatter(xs, ys, s=5, color="black", zorder=3)
-
     # rooms
     for poly in rooms:
         ax.plot(*poly.exterior.xy, linewidth=2)
+
+    # door overlay
+    if show_doors:
+        for d in doors:
+            ax.plot(*d.xy, color="blue", linewidth=2)
 
     if show_dangling:
         for g in dangles.geoms:
@@ -186,8 +282,8 @@ def debug_plot(model, *, show_dangling=True, save: Optional[str | Path] = None):
 
     ax.set_aspect("equal", "box")
     ax.axis("off")
-
     (fig.savefig(save, dpi=300, bbox_inches="tight") if save else _plt.show())
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -208,11 +304,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("dxf", help="DXF file to analyse")
     parser.add_argument("--plot", nargs="?", const="_show_", help="Show/save plot")
+    parser.add_argument("--doors-only", action="store_true",
+                        help="Plot only detected doors (blue chords)")
+    parser.add_argument("--show-doors", action="store_true",
+                        help="Overlay detected doors on the normal plot")
     ns = parser.parse_args()
 
-    if ns.plot is None:
+    if ns.plot is None and not ns.doors_only:
         for rid, area in count_rooms(ns.dxf):
             print(f"Room {rid}: {area:.2f} ft²")
     else:
-        dest = None if ns.plot == "_show_" else ns.plot
-        debug_plot(ns.dxf, save=dest)
+        dest = None if (ns.plot == "_show_" or ns.plot is None) else ns.plot
+        debug_plot(ns.dxf,
+                  show_dangling=not ns.doors_only,
+                  show_doors=ns.show_doors,
+                  doors_only=ns.doors_only,
+                  save=dest)
